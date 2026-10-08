@@ -1,0 +1,516 @@
+#!/usr/bin/env python3
+"""
+trio - interactive TUI that runs 3 opencode agents in parallel and combines them.
+
+Speed tricks:
+  * one warm `opencode serve` shared by all runs (no cold boot per agent)
+  * quorum: as soon as 2 of 3 agents finish, the straggler is killed
+  * the judge usually just PICKS a winner (a few tokens) instead of rewriting everything
+  * CODE mode applies the winning diff with `git apply` (instant) instead of re-implementing it
+  * FAST mode = a single warm agent, no judge
+
+Keys:   Tab cycle mode (FAST/ASK/CODE)   Ctrl+X cancel   Ctrl+L clear   Ctrl+Q quit
+Cmds:   /mode fast|ask|code   /model a[,b,c]   /judge model   /quorum 1-3
+        /new   /clear   /cancel   /quit
+
+Requires: python-textual (sudo pacman -S python-textual) and opencode in PATH.
+CODE mode needs a git repo.
+"""
+import asyncio
+import atexit
+import os
+import re
+import shutil
+import signal
+import socket
+import subprocess
+import tempfile
+import time
+from dataclasses import dataclass
+
+from rich.markdown import Markdown
+from rich.text import Text
+from textual.app import App, ComposeResult
+from textual.binding import Binding
+from textual.widgets import Footer, Input, RichLog, Static
+
+PERSONAS = [
+    "Approach: the simplest correct solution with the smallest possible change.",
+    "Approach: robustness first. Cover edge cases, error handling, and tests.",
+    "Approach: performance and clean architecture. Avoid wasted work and tech debt.",
+]
+ASK_RULES = (
+    "Do NOT modify any files. Be concise and decisive. Read only what you need and "
+    "batch independent file reads and searches in parallel."
+)
+CODE_RULES = "Be efficient: batch independent reads and searches in parallel, skip needless exploration."
+MAX_CHARS = 30_000
+ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+MODES = ["fast", "ask", "code"]
+
+BANNER = r"""
+  _        _
+ | |_ _ __(_) ___
+ | __| '__| |/ _ \
+ | |_| |  | | (_) |
+  \__|_|  |_|\___/
+"""
+
+
+def clip(s, n=MAX_CHARS):
+    return s if len(s) <= n else s[:n] + "\n...[truncated]"
+
+
+def git(*args, cwd):
+    return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
+
+
+@dataclass
+class Agent:
+    name: str
+    state: str = "off"  # off | waiting | running | done | failed | skipped
+    t0: float = 0.0
+    t1: float = 0.0
+    last: str = ""
+
+    def elapsed(self):
+        if not self.t0:
+            return 0.0
+        end = self.t1 if self.state in ("done", "failed", "skipped") else time.time()
+        return end - self.t0
+
+
+class Trio(App):
+    CSS = """
+    Screen { background: #0a0a0a; }
+    #topbar { height: 1; background: #161616; color: #9a9a9a; padding: 0 1; }
+    #chat { padding: 0 2; background: #0a0a0a; scrollbar-size: 1 1; }
+    #live { height: auto; max-height: 8; padding: 0 2; color: #8a8a8a; }
+    #status { height: auto; padding: 0 2; border-top: solid #2a2a2a; background: #0f0f0f; }
+    #prompt { margin: 0 1; border: round #3a3a3a; background: #111111; }
+    #prompt:focus { border: round #4da3ff; }
+    Footer { background: #161616; }
+    """
+
+    BINDINGS = [
+        Binding("tab", "trio_mode", "mode", priority=True),
+        Binding("ctrl+x", "trio_cancel", "cancel"),
+        Binding("ctrl+l", "trio_clear", "clear"),
+        Binding("ctrl+q", "quit", "quit"),
+        Binding("ctrl+c", "quit", "quit", show=False, priority=True),
+    ]
+
+    def __init__(self):
+        super().__init__()
+        self.trio_mode = "ask"
+        self.trio_models = []      # per-agent models (cycled); empty = opencode default
+        self.trio_judge_model = None
+        self.trio_quorum = 2
+        self.trio_busy = False
+        self.trio_job = None
+        self.trio_procs = set()
+        self.trio_history = []
+        self.trio_live = []
+        self.trio_server = None
+        self.trio_url = None
+        self.trio_attach_ok = True
+        self.trio_boot = None
+        self.trio_agents = [Agent("agent 1"), Agent("agent 2"), Agent("agent 3"), Agent("judge")]
+
+    # ---------- layout ----------
+    def compose(self) -> ComposeResult:
+        yield Static(id="topbar")
+        yield RichLog(id="chat", wrap=True, markup=False, highlight=False, auto_scroll=True)
+        yield Static(id="live")
+        yield Static(id="status")
+        yield Input(id="prompt", placeholder="Ask trio anything...  (Tab: mode, /help)")
+        yield Footer()
+
+    def on_mount(self):
+        chat = self.query_one("#chat", RichLog)
+        chat.write(Text(BANNER, style="bold #4da3ff"))
+        chat.write(Text("3 opencode agents in parallel, combined into one result.", style="#9a9a9a"))
+        chat.write(Text(f"Working in {os.getcwd()}\n", style="#6a6a6a"))
+        if not shutil.which("opencode"):
+            chat.write(Text("opencode not found in PATH. Install it first.\n", style="bold red"))
+        else:
+            self.trio_boot = asyncio.create_task(self.trio_start_server())
+        self.query_one("#prompt", Input).focus()
+        self.set_interval(0.1, self.trio_refresh)
+
+    # ---------- warm server ----------
+    async def trio_start_server(self):
+        try:
+            s = socket.socket()
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+            s.close()
+            self.trio_server = await asyncio.create_subprocess_exec(
+                "opencode", "serve", "--hostname", "127.0.0.1", "--port", str(port),
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+                cwd=os.getcwd(),
+            )
+            pid = self.trio_server.pid
+
+            def _stop():
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except Exception:  # noqa: BLE001
+                    pass
+
+            atexit.register(_stop)
+            for _ in range(150):
+                if self.trio_server.returncode is not None:
+                    return
+                try:
+                    _, w = await asyncio.open_connection("127.0.0.1", port)
+                    w.close()
+                    self.trio_url = f"http://127.0.0.1:{port}"
+                    return
+                except OSError:
+                    await asyncio.sleep(0.1)
+        except Exception:  # noqa: BLE001
+            self.trio_url = None
+
+    # ---------- ui ----------
+    def trio_refresh(self):
+        mode_style = {"fast": "bold #7fd88f", "ask": "bold #c099ff", "code": "bold #e5c07b"}[self.trio_mode]
+        bar = Text(" trio ", style="bold black on #4da3ff")
+        bar.append("  mode ")
+        bar.append(self.trio_mode.upper(), style=mode_style)
+        bar.append(f"   quorum {self.trio_quorum}/3")
+        bar.append(f"   model {','.join(self.trio_models) or 'default'}")
+        bar.append("   warm ")
+        if self.trio_url and self.trio_attach_ok:
+            bar.append("●", style="green")
+        else:
+            bar.append("○", style="grey50")
+        bar.append(f"   {os.path.basename(os.getcwd())}")
+        self.query_one("#topbar", Static).update(bar)
+
+        status = self.query_one("#status", Static)
+        live = self.query_one("#live", Static)
+        status.display = self.trio_busy
+        live.display = self.trio_busy and bool(self.trio_live)
+        if not self.trio_busy:
+            return
+        width = max(10, self.size.width - 40)
+        if self.trio_live:
+            live.update(Text("\n".join(l[: self.size.width - 6] for l in self.trio_live[-6:])))
+        spin = SPINNER[int(time.time() * 10) % len(SPINNER)]
+        t = Text()
+        rows = [a for a in self.trio_agents if a.state != "off"]
+        for i, a in enumerate(rows):
+            icon, style = {
+                "running": (spin, "yellow"),
+                "done": ("✓", "green"),
+                "failed": ("✗", "red"),
+                "skipped": ("–", "grey50"),
+            }.get(a.state, ("○", "grey50"))
+            t.append(f"{icon} ", style=style)
+            t.append(f"{a.name:<8}", style="bold")
+            t.append(f"{a.state:<8}", style=style)
+            t.append(f"{a.elapsed():5.1f}s  " if a.t0 else "        ")
+            t.append(a.last[:width], style="#6a6a6a")
+            if i < len(rows) - 1:
+                t.append("\n")
+        status.update(t)
+
+    def trio_live_line(self, line):
+        if line.strip():
+            self.trio_live.append(line)
+
+    # ---------- actions ----------
+    def action_trio_mode(self):
+        if not self.trio_busy:
+            self.trio_mode = MODES[(MODES.index(self.trio_mode) + 1) % len(MODES)]
+
+    def action_trio_clear(self):
+        self.query_one("#chat", RichLog).clear()
+
+    def action_trio_cancel(self):
+        if self.trio_job and not self.trio_job.done():
+            self.trio_job.cancel()
+
+    # ---------- input ----------
+    async def on_input_submitted(self, event: Input.Submitted):
+        text = event.value.strip()
+        event.input.value = ""
+        if not text:
+            return
+        chat = self.query_one("#chat", RichLog)
+        if text.startswith("/"):
+            return self.trio_command(text, chat)
+        if self.trio_busy:
+            chat.write(Text("Still working. Ctrl+X to cancel.", style="yellow"))
+            return
+        self.trio_job = asyncio.create_task(self.trio_run_job(text))
+
+    def trio_command(self, text, chat):
+        cmd, _, arg = text.partition(" ")
+        arg = arg.strip()
+        note = lambda s: chat.write(Text(s, style="#9a9a9a"))  # noqa: E731
+        if cmd == "/mode" and arg in MODES:
+            self.trio_mode = arg
+        elif cmd == "/model":
+            self.trio_models = [m.strip() for m in arg.split(",") if m.strip()]
+            note(f"agent models: {', '.join(self.trio_models) or 'default'}")
+        elif cmd == "/judge":
+            self.trio_judge_model = arg or None
+            note(f"judge model: {self.trio_judge_model or 'default'}")
+        elif cmd == "/quorum" and arg in ("1", "2", "3"):
+            self.trio_quorum = int(arg)
+        elif cmd == "/clear":
+            self.action_trio_clear()
+        elif cmd == "/cancel":
+            self.action_trio_cancel()
+        elif cmd == "/new":
+            self.trio_history.clear()
+            note("conversation context reset")
+        elif cmd in ("/quit", "/exit"):
+            self.exit()
+        else:
+            note(
+                "/mode fast|ask|code   /model a[,b,c]   /judge model   /quorum 1-3\n"
+                "/new (reset context)   /clear   /cancel   /quit\n\n"
+                "FAST = one warm agent, no judge (quickest).\n"
+                "ASK  = 3 read-only agents, first N finish, judge picks or merges.\n"
+                "CODE = 3 agents in git worktrees, judge picks the best diff and it is applied instantly.\n"
+                "Tip: give /model several models (a,b,c) so the agents think differently."
+            )
+
+    # ---------- orchestration ----------
+    def trio_with_history(self, prompt):
+        if not self.trio_history:
+            return prompt
+        ctx = "\n\n".join(f"User: {p}\nAssistant: {clip(r, 3000)}" for p, r in self.trio_history[-3:])
+        return f"Conversation so far:\n{ctx}\n\nNew request:\n{prompt}"
+
+    def trio_model_for(self, i):
+        return self.trio_models[i % len(self.trio_models)] if self.trio_models else None
+
+    async def trio_run_job(self, prompt):
+        chat = self.query_one("#chat", RichLog)
+        self.trio_busy = True
+        self.trio_live = []
+        for a in self.trio_agents:
+            a.state, a.t0, a.t1, a.last = "off", 0.0, 0.0, ""
+        used = [0] if self.trio_mode == "fast" else [0, 1, 2, 3]
+        for i in used:
+            self.trio_agents[i].state = "waiting"
+        chat.write(Text(f"\n> {prompt}", style="bold #4da3ff"))
+        try:
+            full = self.trio_with_history(prompt)
+            fn = {"fast": self.trio_fast, "ask": self.trio_ask, "code": self.trio_code}[self.trio_mode]
+            result = (await fn(full)) or "(no output)"
+            self.trio_history.append((prompt, result))
+            chat.write(Markdown(result))
+        except asyncio.CancelledError:
+            chat.write(Text("cancelled", style="yellow"))
+        except Exception as e:  # noqa: BLE001
+            chat.write(Text(f"error: {e}", style="bold red"))
+        finally:
+            for p in list(self.trio_procs):
+                if p.returncode is None:
+                    p.kill()
+            self.trio_busy = False
+            self.trio_live = []
+
+    async def trio_opencode(self, prompt, cwd, agent, model=None, use_server=False, on_line=None):
+        attach = bool(use_server and self.trio_url and self.trio_attach_ok)
+        cmd = ["opencode", "run"]
+        if attach:
+            cmd += ["--attach", self.trio_url]
+        if model:
+            cmd += ["-m", model]
+        cmd.append(prompt)
+        agent.state, agent.t0, agent.t1, agent.last = "running", time.time(), 0.0, ""
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, cwd=cwd, limit=2 ** 20,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+        )
+        self.trio_procs.add(proc)
+        lines = []
+        try:
+            async for raw in proc.stdout:
+                line = ANSI.sub("", raw.decode(errors="replace")).rstrip()
+                lines.append(line)
+                if line.strip():
+                    agent.last = line.strip()
+                    if on_line:
+                        on_line(line)
+            await proc.wait()
+        except asyncio.CancelledError:
+            proc.kill()
+            agent.state, agent.t1 = "skipped", time.time()
+            raise
+        finally:
+            self.trio_procs.discard(proc)
+        if proc.returncode != 0 and attach:
+            # --attach unsupported or server hiccup: stop using the warm server and retry once
+            self.trio_attach_ok = False
+            return await self.trio_opencode(prompt, cwd, agent, model, False, on_line)
+        agent.t1 = time.time()
+        agent.state = "done" if proc.returncode == 0 else "failed"
+        return "\n".join(lines).strip()
+
+    async def trio_race(self, coros, k):
+        """Run coroutines in parallel (index i -> trio_agents[i]); stop once k succeed."""
+        k = min(k, len(coros))
+        tasks = {asyncio.create_task(c): i for i, c in enumerate(coros)}
+        pending, results = set(tasks), {}
+        try:
+            while pending and len(results) < k:
+                done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                for t in done:
+                    i = tasks[t]
+                    try:
+                        text = t.result()
+                    except (Exception, asyncio.CancelledError):  # noqa: BLE001
+                        continue
+                    if self.trio_agents[i].state == "done" and text:
+                        results[i] = text
+        finally:
+            for t in pending:
+                t.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+        if not results:
+            raise RuntimeError("all agents failed")
+        return results
+
+    # ----- FAST -----
+    async def trio_fast(self, prompt):
+        return await self.trio_opencode(
+            f"{prompt}\n\n{CODE_RULES}", os.getcwd(), self.trio_agents[0],
+            self.trio_model_for(0), True, self.trio_live_line,
+        )
+
+    # ----- ASK -----
+    async def trio_ask(self, prompt):
+        cwd = os.getcwd()
+        got = await self.trio_race([
+            self.trio_opencode(f"{prompt}\n\n{PERSONAS[i]}\n{ASK_RULES}", cwd,
+                               self.trio_agents[i], self.trio_model_for(i), True)
+            for i in range(3)
+        ], self.trio_quorum)
+        if len(got) == 1:
+            self.trio_agents[3].state = "off"
+            return next(iter(got.values()))
+        judge_prompt = (
+            f"Original task:\n{prompt}\n\n"
+            f"Here are independent answers from {len(got)} assistants.\n"
+            "If ONE answer is complete and correct and the others add nothing important, reply with "
+            "only: WINNER: <number>\n"
+            "Otherwise write the final merged answer directly with no preamble: keep what is correct "
+            "and agreed, resolve conflicts (check the code if needed), drop anything wrong. "
+            "Do NOT modify files.\n\n"
+            + "\n\n".join(f"=== Answer {i + 1} ===\n{clip(t)}" for i, t in sorted(got.items()))
+        )
+        out = await self.trio_opencode(judge_prompt, cwd, self.trio_agents[3],
+                                       self.trio_judge_model, True, self.trio_live_line)
+        m = re.search(r"WINNER:\s*(\d)", out)
+        if m and (int(m.group(1)) - 1) in got and len(out) < 200:
+            return got[int(m.group(1)) - 1]
+        return out or next(iter(got.values()))
+
+    # ----- CODE -----
+    async def trio_code(self, prompt):
+        top = await asyncio.to_thread(git, "rev-parse", "--show-toplevel", cwd=os.getcwd())
+        if top.returncode != 0:
+            raise RuntimeError("CODE mode needs a git repo. Use ASK/FAST mode or cd into one.")
+        repo = top.stdout.strip()
+        snap = (await asyncio.to_thread(git, "stash", "create", cwd=repo)).stdout.strip() or "HEAD"
+        tmp = tempfile.mkdtemp(prefix="trio-")
+        trees = [os.path.join(tmp, f"wt{i + 1}") for i in range(3)]
+        try:
+            made = await asyncio.gather(*[
+                asyncio.to_thread(git, "worktree", "add", "--detach", t, snap, cwd=repo) for t in trees
+            ])
+            for r in made:
+                if r.returncode != 0:
+                    raise RuntimeError(f"worktree failed: {r.stderr.strip()}")
+
+            got = await self.trio_race([
+                self.trio_opencode(f"{prompt}\n\n{PERSONAS[i]}\n{CODE_RULES}", trees[i],
+                                   self.trio_agents[i], self.trio_model_for(i), False)
+                for i in range(3)
+            ], self.trio_quorum)
+
+            diffs = {}
+            for i in got:
+                await asyncio.to_thread(git, "add", "-A", cwd=trees[i])
+                d = await asyncio.to_thread(git, "diff", "--cached", "--binary", "HEAD", cwd=trees[i])
+                diffs[i] = d.stdout
+
+            # one candidate (or only one with changes): no judging needed
+            with_changes = [i for i in got if diffs[i].strip()]
+            if not with_changes:
+                self.trio_agents[3].state = "off"
+                return next(iter(got.values()))
+            use_server = repo == os.getcwd()
+            winner = with_changes[0] if len(with_changes) == 1 else None
+            if winner is None:
+                judge_prompt = (
+                    f"Original task:\n{prompt}\n\n"
+                    "Several agents attempted this in separate worktrees. Their summaries and diffs "
+                    "are below. Do NOT modify any files.\n"
+                    "If ONE agent's diff fully and correctly solves the task, reply with: "
+                    "WINNER: <number> and optionally one short sentence why.\n"
+                    "If the best result needs ideas from several diffs, reply with only: COMBINE\n\n"
+                    + "\n\n".join(
+                        f"=== Agent {i + 1} summary ===\n{clip(got[i], 4000)}\n"
+                        f"=== Agent {i + 1} diff ===\n{clip(diffs[i])}"
+                        for i in with_changes)
+                )
+                out = await self.trio_opencode(judge_prompt, repo, self.trio_agents[3],
+                                               self.trio_judge_model, use_server, self.trio_live_line)
+                m = re.search(r"WINNER:\s*(\d)", out)
+                if m and (int(m.group(1)) - 1) in with_changes:
+                    winner = int(m.group(1)) - 1
+            else:
+                self.trio_agents[3].state = "off"
+
+            if winner is not None and await self.trio_apply(repo, diffs[winner]):
+                return f"**Applied agent {winner + 1}'s changes.**\n\n{clip(got[winner], 4000)}"
+
+            # COMBINE (or patch would not apply): one agent re-implements the best mix
+            self.trio_agents[3].state = "waiting"
+            merge_prompt = (
+                f"Original task:\n{prompt}\n\n"
+                "Independent agents each attempted this in separate worktrees. Their summaries and "
+                "diffs are below. Implement the BEST combined solution in the current working "
+                "directory: take the strongest ideas from each, avoid duplicate or conflicting "
+                "changes, and verify it works (run tests if present). Finish with a short summary.\n\n"
+                + "\n\n".join(
+                    f"=== Agent {i + 1} summary ===\n{clip(got[i], 4000)}\n"
+                    f"=== Agent {i + 1} diff ===\n{clip(diffs[i])}"
+                    for i in with_changes)
+            )
+            return await self.trio_opencode(merge_prompt, repo, self.trio_agents[3],
+                                            self.trio_judge_model, use_server, self.trio_live_line)
+        finally:
+            await asyncio.gather(*[
+                asyncio.to_thread(git, "worktree", "remove", "--force", t, cwd=repo) for t in trees
+            ], return_exceptions=True)
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    async def trio_apply(self, repo, diff):
+        if not diff.endswith("\n"):
+            diff += "\n"
+        with tempfile.NamedTemporaryFile("w", suffix=".patch", delete=False) as f:
+            f.write(diff)
+            path = f.name
+        try:
+            for flags in ([], ["--3way"]):
+                r = await asyncio.to_thread(git, "apply", *flags, path, cwd=repo)
+                if r.returncode == 0:
+                    return True
+            return False
+        finally:
+            os.unlink(path)
+
+
+if __name__ == "__main__":
+    Trio().run()
