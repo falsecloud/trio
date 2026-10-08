@@ -18,6 +18,7 @@ CODE mode needs a git repo.
 """
 import asyncio
 import atexit
+import difflib
 import os
 import re
 import shutil
@@ -35,9 +36,9 @@ from textual.binding import Binding
 from textual.widgets import Footer, Input, RichLog, Static
 
 PERSONAS = [
-    "Approach: the simplest correct solution with the smallest possible change.",
-    "Approach: robustness first. Cover edge cases, error handling, and tests.",
-    "Approach: performance and clean architecture. Avoid wasted work and tech debt.",
+    "If it helps, take this approach: the simplest correct solution with the smallest possible change.",
+    "If it helps, take this approach: robustness first. Cover edge cases, error handling, and tests.",
+    "If it helps, take this approach: performance and clean architecture. Avoid wasted work and tech debt.",
 ]
 ASK_RULES = (
     "Do NOT modify any files. Be concise and decisive. Read only what you need and "
@@ -103,7 +104,7 @@ class Trio(App):
 
     def __init__(self):
         super().__init__()
-        self.trio_mode = "ask"
+        self.trio_mode = "fast"
         self.trio_models = []      # per-agent models (cycled); empty = opencode default
         self.trio_judge_model = None
         self.trio_quorum = 2
@@ -261,6 +262,9 @@ class Trio(App):
             note(f"judge model: {self.trio_judge_model or 'default'}")
         elif cmd == "/quorum" and arg in ("1", "2", "3"):
             self.trio_quorum = int(arg)
+        elif cmd == "/warm" and arg in ("on", "off"):
+            self.trio_attach_ok = arg == "on"
+            note(f"warm server {'enabled' if self.trio_attach_ok else 'disabled'}")
         elif cmd == "/clear":
             self.action_trio_clear()
         elif cmd == "/cancel":
@@ -273,7 +277,7 @@ class Trio(App):
         else:
             note(
                 "/mode fast|ask|code   /model a[,b,c]   /judge model   /quorum 1-3\n"
-                "/new (reset context)   /clear   /cancel   /quit\n\n"
+                "/warm on|off (use the warm server)   /new (reset context)   /clear   /cancel   /quit\n\n"
                 "FAST = one warm agent, no judge (quickest).\n"
                 "ASK  = 3 read-only agents, first N finish, judge picks or merges.\n"
                 "CODE = 3 agents in git worktrees, judge picks the best diff and it is applied instantly.\n"
@@ -296,16 +300,26 @@ class Trio(App):
         self.trio_live = []
         for a in self.trio_agents:
             a.state, a.t0, a.t1, a.last = "off", 0.0, 0.0, ""
-        used = [0] if self.trio_mode == "fast" else [0, 1, 2, 3]
+        mode = self.trio_mode
+        if mode == "ask" and len(prompt.split()) <= 3 and "?" not in prompt:
+            mode = "fast"  # no point running 4 model calls for "hi"
+        t_start = time.time()
+        used = [0] if mode == "fast" else [0, 1, 2, 3]
         for i in used:
             self.trio_agents[i].state = "waiting"
         chat.write(Text(f"\n> {prompt}", style="bold #4da3ff"))
         try:
             full = self.trio_with_history(prompt)
-            fn = {"fast": self.trio_fast, "ask": self.trio_ask, "code": self.trio_code}[self.trio_mode]
+            fn = {"fast": self.trio_fast, "ask": self.trio_ask, "code": self.trio_code}[mode]
             result = (await fn(full)) or "(no output)"
             self.trio_history.append((prompt, result))
             chat.write(Markdown(result))
+            parts = " · ".join(
+                f"{a.name.replace('agent ', 'a')} {a.elapsed():.0f}s"
+                for a in self.trio_agents if a.state != "off")
+            warm = "warm" if (self.trio_url and self.trio_attach_ok) else "cold"
+            chat.write(Text(f"{mode.upper()} · {time.time() - t_start:.0f}s total · {parts} · {warm}",
+                            style="#6a6a6a"))
         except asyncio.CancelledError:
             chat.write(Text("cancelled", style="yellow"))
         except Exception as e:  # noqa: BLE001
@@ -382,8 +396,9 @@ class Trio(App):
 
     # ----- FAST -----
     async def trio_fast(self, prompt):
+        text = prompt if len(prompt.split()) <= 8 else f"{prompt}\n\n{CODE_RULES}"
         return await self.trio_opencode(
-            f"{prompt}\n\n{CODE_RULES}", os.getcwd(), self.trio_agents[0],
+            text, os.getcwd(), self.trio_agents[0],
             self.trio_model_for(0), True, self.trio_live_line,
         )
 
@@ -398,6 +413,10 @@ class Trio(App):
         if len(got) == 1:
             self.trio_agents[3].state = "off"
             return next(iter(got.values()))
+        vals = list(got.values())
+        if len(vals) >= 2 and difflib.SequenceMatcher(None, vals[0][:3000], vals[1][:3000]).ratio() >= 0.8:
+            self.trio_agents[3].state = "off"  # agents agree: skip the judge call entirely
+            return vals[0]
         judge_prompt = (
             f"Original task:\n{prompt}\n\n"
             f"Here are independent answers from {len(got)} assistants.\n"

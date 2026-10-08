@@ -48,11 +48,13 @@ You type a prompt once. Three agents attack it at the same time, each with a sli
 | **ASK** | 3 read-only agents, then a judge | Explanations, code review, design questions |
 | **CODE** | 3 agents, each in its own git worktree, then a judge | Changes you want cross-checked before they touch your repo |
 
+trio starts in **FAST**. In ASK mode, very short prompts (3 words or fewer, no question mark, e.g. "hi") are automatically run in FAST, because three agents plus a judge is pointless for a greeting.
+
 ### The pieces
 
 - **Warm server.** On launch, trio starts one `opencode serve` on a random localhost port. Runs use `opencode run --attach <url>` so agents don't pay a cold start each time. If `--attach` isn't supported by your opencode version, trio notices the failure, retries without it, and carries on (the "warm" dot in the top bar turns grey).
 - **Quorum.** Once N of the 3 agents finish successfully (default 2), the remaining one is killed instead of waited on. Change it with `/quorum`.
-- **Judge.** The judge usually answers with just `WINNER: <n>`, which is cheap and fast. It only writes a merged answer when the agents each contributed something the others lacked.
+- **Judge.** The judge usually answers with just `WINNER: <n>`, which is cheap and fast. It only writes a merged answer when the agents each contributed something the others lacked. In ASK mode the judge is skipped entirely when the first two answers are at least 80% similar.
 - **CODE mode internals.** trio snapshots your tracked changes with `git stash create`, creates three detached worktrees from that snapshot, and lets one agent edit in each. It collects each diff (`git diff --cached --binary`), and the judge replies `WINNER: <n>` or `COMBINE`. A winner is applied to your working tree with `git apply` (falling back to `--3way`). On `COMBINE`, or if the patch won't apply, one agent re-implements the best mix in your repo. Worktrees are removed afterwards.
 - **Context.** The last three exchanges are included in each new prompt, so follow-ups work. `/new` resets it.
 
@@ -130,6 +132,8 @@ trio
 
 The top bar shows the current mode, quorum, models, whether the warm server is up, and the folder.
 
+After each result trio prints a dim timing line, for example `ASK · 74s total · a1 40s · a2 52s · judge 22s · warm`, showing how long each step took and whether the warm server was used.
+
 ### Keys
 
 | Key | Action |
@@ -148,6 +152,7 @@ The top bar shows the current mode, quorum, models, whether the warm server is u
 | `/model a[,b,c]` | Models for agents 1-3, as `provider/model`. One value is reused, several are cycled. No value resets to opencode's default. |
 | `/judge model` | Model for the judge. No value resets to default. |
 | `/quorum 1\|2\|3` | How many agents must finish before the judge runs |
+| `/warm on\|off` | Turn the warm opencode server on or off (off = every run cold-starts; handy for diagnosing slowness) |
 | `/new` | Forget conversation context |
 | `/clear` | Clear the screen |
 | `/cancel` | Cancel the running job |
@@ -241,6 +246,9 @@ Use a UTF-8 locale (`locale | grep UTF-8`), a font with Braille characters, and 
 - Set `/quorum 2` (default) or `/quorum 1`.
 - Use faster models for agents and a strong one only for the judge.
 - Check the warm dot is green.
+- Read the timing line under the result. If one agent or the judge dominates, that step's model is the bottleneck.
+- Compare against `time opencode run "hi"`. If plain opencode is just as slow, the cause is your default model, not trio: set a faster one with `/model provider/fast-model`.
+- Try `/warm off` to rule out the warm server.
 
 ### Leftover processes after a crash
 ```bash
